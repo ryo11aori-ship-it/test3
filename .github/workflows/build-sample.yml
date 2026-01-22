@@ -1,0 +1,161 @@
+name: Build Product (Windows)
+
+# 手動実行と main ブランチへの push をトリガーにします
+on:
+  workflow_dispatch:
+  push:
+    branches: ["main"]
+    paths:
+      - 'tool/**'
+      - '.github/workflows/build-product.yml'
+
+jobs:
+  build-windows-product:
+    name: Build autobuildtool.exe on Windows
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      # 修正: 不安定なChocolateyを廃止し、専用アクションで確実にZig(0.13.0)を入れる
+      - name: Setup Zig
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: 0.13.0
+
+      # 修正: Zig 0.11以降のJSON出力に対応した、より堅牢なパス検出ロジックに変更
+      - name: Find zig.exe and lib path
+        id: findzig
+        shell: powershell
+        run: |
+          # zig env の出力をJSONとして安全にパース
+          $zigEnvJson = zig env | Out-String | ConvertFrom-Json
+          
+          $zigExe = $zigEnvJson.zig_exe
+          $zigLib = $zigEnvJson.lib_dir
+
+          Write-Host "Real Zig exe: $zigExe"
+          Write-Host "Real Zig lib: $zigLib"
+          
+          # 空チェック
+          if (-not $zigExe -or -not $zigLib) {
+            Write-Error "Failed to parse zig env output"
+            exit 1
+          }
+
+          echo "zigpath=$zigExe" >> $env:GITHUB_OUTPUT
+          echo "ziglibpath=$zigLib" >> $env:GITHUB_OUTPUT
+      
+      - name: Copy zig.exe and lib into repo (tool/zig)
+        shell: powershell
+        run: |
+          $destRoot = Join-Path $PWD "tool\zig"
+          $destLib = Join-Path $destRoot "lib"
+          
+          # フォルダ作成
+          New-Item -Path $destRoot -ItemType Directory -Force | Out-Null
+          New-Item -Path $destLib -ItemType Directory -Force | Out-Null
+          
+          # exeのコピー
+          Copy-Item -Path "${{ steps.findzig.outputs.zigpath }}" -Destination (Join-Path $destRoot "zig.exe") -Force
+          
+          # libフォルダの中身をコピー（再帰的）
+          Copy-Item -Path "${{ steps.findzig.outputs.ziglibpath }}\*" -Destination $destLib -Recurse -Force
+          
+          Write-Host "Copied zig exe and lib to $destRoot"
+
+      - name: Install PyInstaller and Pillow
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller Pillow
+
+      - name: Auto-Convert Icon to ICO
+        shell: python
+        run: |
+          import os
+          from PIL import Image
+          from pathlib import Path
+          
+          # 変換候補 (優先順: png -> jpg -> jpeg)
+          search_dir = Path("tool")
+          candidates = ["icon.png", "icon.jpg", "icon.jpeg"]
+          source_img = None
+          
+          for f in candidates:
+              p = search_dir / f
+              if p.exists():
+                  source_img = p
+                  break
+          
+          target_ico = search_dir / "icon.ico"
+          
+          if source_img:
+              print(f"Icon source found: {source_img}")
+              try:
+                  img = Image.open(source_img)
+                  # ICOとして保存 (複数のサイズを格納)
+                  img.save(target_ico, format='ICO', sizes=[(256, 256), (128, 128), (64, 64), (48, 48), (32, 32), (16, 16)])
+                  print(f"Converted to {target_ico}")
+              except Exception as e:
+                  print(f"Warning: Failed to convert icon. {e}")
+          else:
+              print("No icon source (icon.png/jpg) found. Skipping icon conversion.")
+
+      - name: Build autobuildtool.exe (PyInstaller)
+        shell: cmd
+        run: |
+          rem Ensure previous build artifacts removed
+          if exist dist rmdir /s /q dist
+          if exist build rmdir /s /q build
+          if exist autobuildtool.spec del /f /q autobuildtool.spec
+          
+          rem アイコンファイルが存在するか確認してオプションを決定
+          set ICON_OPT=
+          if exist "tool\icon.ico" set ICON_OPT=--icon "tool\icon.ico"
+          
+          rem --add-data で lib フォルダを同梱 (Windowsの区切り文字はセミコロン)
+          pyinstaller --onefile --name autobuildtool tool\autobuildtool.py --add-binary "tool\zig\zig.exe;zig" --add-data "tool\zig\lib;zig\lib" %ICON_OPT%
+      
+      - name: Verify Icon (Extract to PNG)
+        shell: powershell
+        run: |
+          Add-Type -AssemblyName System.Drawing
+          
+          $exePath = "dist\autobuildtool.exe"
+          $pngPath = "dist\icon_preview.png"
+          
+          if (Test-Path $exePath) {
+            # exeからアイコンを抽出
+            $icon = [System.Drawing.Icon]::ExtractAssociatedIcon($exePath)
+            
+            if ($icon) {
+                # 画像(Bitmap)に変換して保存
+                $bitmap = $icon.ToBitmap()
+                $bitmap.Save($pngPath, [System.Drawing.Imaging.ImageFormat]::Png)
+                Write-Host "Icon extracted to $pngPath"
+            } else {
+                Write-Host "No icon found in exe (using default)."
+            }
+          } else {
+            Write-Error "EXE not found!"
+          }
+
+      - name: Upload Icon Preview
+        uses: actions/upload-artifact@v4
+        if: hashFiles('dist/icon_preview.png') != ''
+        with:
+          name: icon-check
+          path: dist/icon_preview.png
+
+      - name: Upload artifact (autobuildtool.exe)
+        uses: actions/upload-artifact@v4
+        with:
+          name: autobuildtool-windows
+          path: dist/autobuildtool.exe
